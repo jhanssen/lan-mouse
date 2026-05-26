@@ -388,7 +388,10 @@ impl Emulation for MacOSEmulation {
                         axis,
                         value,
                     } => {
-                        let value = value as i32;
+                        // wl_pointer.axis uses surface-local coordinates
+                        // (positive = scroll down), CGEventCreateScrollWheelEvent
+                        // uses the opposite (positive = scroll up), so negate.
+                        let value = -(value as i32);
                         let (count, wheel1, wheel2, wheel3) = match axis {
                             0 => (1, value, 0, 0), // 0 = vertical => 1 scroll wheel device (y axis)
                             1 => (2, 0, value, 0), // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)
@@ -415,6 +418,8 @@ impl Emulation for MacOSEmulation {
                     }
                     PointerEvent::AxisDiscrete120 { axis, value } => {
                         const LINES_PER_STEP: i32 = 3;
+                        // see PointerEvent::Axis above re: sign convention
+                        let value = -value;
                         let (count, wheel1, wheel2, wheel3) = match axis {
                             0 => (1, value / (120 / LINES_PER_STEP), 0, 0), // 0 = vertical => 1 scroll wheel device (y axis)
                             1 => (2, 0, value / (120 / LINES_PER_STEP), 0), // 1 = horizontal => 2 scroll wheel devices (y, x) -> (0, x)

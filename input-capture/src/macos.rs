@@ -357,6 +357,11 @@ fn get_events(
             })))
         }
         CGEventType::ScrollWheel => {
+            // CoreGraphics scroll deltas use the convention that positive =
+            // scroll up. The lan-mouse wire protocol uses the Wayland
+            // convention (positive = scroll down, matching wl_pointer.axis
+            // surface-local coordinates). Negate on the way out so peers on
+            // any platform see a consistent sign.
             if ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_IS_CONTINUOUS) != 0 {
                 let v =
                     ev.get_integer_value_field(EventField::SCROLL_WHEEL_EVENT_POINT_DELTA_AXIS_1);
@@ -366,14 +371,14 @@ fn get_events(
                     result.push(CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
                         time: 0,
                         axis: 0, // Vertical
-                        value: v as f64,
+                        value: -(v as f64),
                     })));
                 }
                 if h != 0 {
                     result.push(CaptureEvent::Input(Event::Pointer(PointerEvent::Axis {
                         time: 0,
                         axis: 1, // Horizontal
-                        value: h as f64,
+                        value: -(h as f64),
                     })));
                 }
             } else {
@@ -386,7 +391,7 @@ fn get_events(
                     result.push(CaptureEvent::Input(Event::Pointer(
                         PointerEvent::AxisDiscrete120 {
                             axis: 0, // Vertical
-                            value: V120_STEPS_PER_LINE * v as i32,
+                            value: -V120_STEPS_PER_LINE * v as i32,
                         },
                     )));
                 }
@@ -394,7 +399,7 @@ fn get_events(
                     result.push(CaptureEvent::Input(Event::Pointer(
                         PointerEvent::AxisDiscrete120 {
                             axis: 1, // Horizontal
-                            value: V120_STEPS_PER_LINE * h as i32,
+                            value: -V120_STEPS_PER_LINE * h as i32,
                         },
                     )));
                 }
