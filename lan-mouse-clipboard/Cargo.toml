@@ -1,0 +1,34 @@
+[package]
+name = "lan-mouse-clipboard"
+description = "cross-platform clipboard sync library used by lan-mouse"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/feschber/lan-mouse"
+
+[dependencies]
+async-trait = "0.1"
+log = "0.4"
+thiserror = "2.0"
+tokio = { version = "1.32", features = ["sync", "rt", "macros"] }
+postcard = { version = "1.0", features = ["use-std"] }
+serde = { version = "1.0", features = ["derive"] }
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wayland-protocols-wlr = { version = "0.3", features = ["client"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSArray",
+    "NSData",
+    "NSEnumerator",
+    "NSString",
+] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSPasteboard",
+] }

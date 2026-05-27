@@ -1,13 +1,19 @@
 use crate::{
     capture::{Capture, CaptureType, ICaptureEvent},
     client::ClientManager,
+    clipboard::{Clipboard, NetOutcome},
+    clipboard_net::{ClipboardNet, ClipboardNetError, ClipboardNetEvent},
     config::{Config, ConfigClient},
-    connect::LanMouseConnection,
+    connect::{DtlsLifecycleEvent, LanMouseConnection},
     crypto,
     dns::{DnsEvent, DnsResolver},
     emulation::{Emulation, EmulationEvent},
     listen::{LanMouseListener, ListenerCreationError},
 };
+use lan_mouse_clipboard::{
+    ClipboardChange, ClipboardCreationError, LanMouseClipboard,
+};
+use local_channel::mpsc::{Receiver as LocalReceiver, channel as local_channel};
 use futures::StreamExt;
 use hickory_resolver::ResolveError;
 use lan_mouse_ipc::{
@@ -36,6 +42,10 @@ pub enum ServiceError {
     ListenError(#[from] ListenerCreationError),
     #[error("failed to load certificate: `{0}`")]
     Certificate(#[from] crypto::Error),
+    #[error(transparent)]
+    ClipboardNet(#[from] ClipboardNetError),
+    #[error(transparent)]
+    Clipboard(#[from] ClipboardCreationError),
 }
 
 pub struct Service {
@@ -70,6 +80,12 @@ pub struct Service {
     /// map from capture handle to connection info
     incoming_conn_info: HashMap<ClientHandle, Incoming>,
     next_trigger_handle: u64,
+    /// clipboard TCP side-channel
+    clipboard_net: ClipboardNet,
+    /// clipboard subsystem (backend + loop-suppression state)
+    clipboard: Clipboard,
+    /// DTLS lifecycle events emitted by `LanMouseConnection`
+    dtls_lifecycle: LocalReceiver<DtlsLifecycleEvent>,
 }
 
 #[derive(Debug)]
@@ -97,7 +113,23 @@ impl Service {
         // listener + connection
         let listener =
             LanMouseListener::new(config.port(), cert.clone(), authorized_keys.clone()).await?;
-        let conn = LanMouseConnection::new(cert.clone(), client_manager.clone());
+        let (lifecycle_tx, lifecycle_rx) = local_channel();
+        let conn =
+            LanMouseConnection::new(cert.clone(), client_manager.clone(), lifecycle_tx);
+
+        // clipboard TCP side-channel on the same port number as UDP.
+        let clipboard_net = ClipboardNet::new(
+            config.port(),
+            cert.clone(),
+            authorized_keys.clone(),
+            public_key_fingerprint.clone(),
+        )
+        .await?;
+
+        // clipboard backend + task
+        let clipboard_backend =
+            LanMouseClipboard::new(None, &public_key_fingerprint)?;
+        let clipboard = Clipboard::new(clipboard_backend, public_key_fingerprint.clone());
 
         // input capture + emulation
         let capture_backend = config.capture_backend().map(|b| b.into());
@@ -126,6 +158,9 @@ impl Service {
             incoming_conn_info: Default::default(),
             incoming_conns: Default::default(),
             next_trigger_handle: 0,
+            clipboard_net,
+            clipboard,
+            dtls_lifecycle: lifecycle_rx,
         };
         Ok(service)
     }
@@ -150,6 +185,9 @@ impl Service {
                 event = self.emulation.event() => self.handle_emulation_event(event),
                 event = self.capture.event() => self.handle_capture_event(event),
                 event = self.resolver.event() => self.handle_resolver_event(event),
+                event = self.clipboard_net.event() => self.handle_clipboard_net_event(event).await,
+                event = self.clipboard.next_backend_event() => self.handle_clipboard_backend_event(event).await,
+                event = self.dtls_lifecycle.recv() => self.handle_dtls_lifecycle(event),
                 _ = self.config.changed() => self.handle_config_change(),
                 r = signal::ctrl_c() => break r.expect("failed to wait for CTRL+C"),
             }
@@ -162,8 +200,48 @@ impl Service {
         self.emulation.terminate().await;
         log::debug!("terminating dns resolver ...");
         self.resolver.terminate().await;
+        log::debug!("terminating clipboard side-channel ...");
+        self.clipboard_net.terminate();
+        log::debug!("terminating clipboard backend ...");
+        self.clipboard.terminate().await;
 
         Ok(())
+    }
+
+    async fn handle_clipboard_net_event(&mut self, event: Option<ClipboardNetEvent>) {
+        let Some(event) = event else {
+            log::warn!("clipboard_net event channel closed");
+            return;
+        };
+        match self.clipboard.handle_net_event(event) {
+            NetOutcome::Nothing => {}
+            NetOutcome::ApplyLocal(content) => {
+                if let Err(e) = self.clipboard.apply_remote(content).await {
+                    log::warn!("clipboard: failed to apply remote content: {e}");
+                }
+            }
+        }
+    }
+
+    async fn handle_clipboard_backend_event(&mut self, event: Option<ClipboardChange>) {
+        let Some(event) = event else {
+            log::warn!("clipboard backend event channel closed");
+            return;
+        };
+        if let Some(msg) = self.clipboard.handle_local_change(event).await {
+            self.clipboard_net.broadcast(msg);
+        }
+    }
+
+    fn handle_dtls_lifecycle(&mut self, event: Option<DtlsLifecycleEvent>) {
+        let Some(event) = event else {
+            log::warn!("dtls lifecycle channel closed");
+            return;
+        };
+        match event {
+            DtlsLifecycleEvent::Connected(addr) => self.clipboard_net.connect_to(addr),
+            DtlsLifecycleEvent::Disconnected(addr) => self.clipboard_net.disconnect_from(addr),
+        }
     }
 
     fn handle_frontend_request(&mut self, request: Option<Result<FrontendRequest, IpcError>>) {
@@ -302,6 +380,10 @@ impl Service {
             EmulationEvent::PortChanged(port) => match port {
                 Ok(port) => {
                     self.port = port;
+                    // Mirror the rebind on the clipboard TCP listener. The
+                    // reply receiver is dropped; failure is logged inside
+                    // clipboard_net.
+                    let _ = self.clipboard_net.request_port_change(port);
                     self.notify_frontend(FrontendEvent::PortChanged(port, None));
                 }
                 Err(e) => self

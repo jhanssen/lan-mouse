@@ -91,6 +91,15 @@ async fn connect_any(
     }
 }
 
+/// Notification of DTLS-level lifecycle changes for a peer. Consumed by
+/// non-DTLS subsystems (e.g. the clipboard side-channel) so they can mirror
+/// the DTLS connection state.
+#[derive(Debug, Clone)]
+pub(crate) enum DtlsLifecycleEvent {
+    Connected(SocketAddr),
+    Disconnected(SocketAddr),
+}
+
 pub(crate) struct LanMouseConnection {
     cert: Certificate,
     client_manager: ClientManager,
@@ -99,10 +108,15 @@ pub(crate) struct LanMouseConnection {
     recv_rx: Receiver<(ClientHandle, ProtoEvent)>,
     recv_tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    lifecycle_tx: Sender<DtlsLifecycleEvent>,
 }
 
 impl LanMouseConnection {
-    pub(crate) fn new(cert: Certificate, client_manager: ClientManager) -> Self {
+    pub(crate) fn new(
+        cert: Certificate,
+        client_manager: ClientManager,
+        lifecycle_tx: Sender<DtlsLifecycleEvent>,
+    ) -> Self {
         let (recv_tx, recv_rx) = channel();
         Self {
             cert,
@@ -112,6 +126,7 @@ impl LanMouseConnection {
             recv_rx,
             recv_tx,
             ping_response: Default::default(),
+            lifecycle_tx,
         }
     }
 
@@ -139,7 +154,14 @@ impl LanMouseConnection {
                     Ok(_) => {}
                     Err(e) => {
                         log::warn!("client {handle} failed to send: {e}");
-                        disconnect(&self.client_manager, handle, addr, &self.conns).await;
+                        disconnect(
+                            &self.client_manager,
+                            handle,
+                            addr,
+                            &self.conns,
+                            &self.lifecycle_tx,
+                        )
+                        .await;
                     }
                 }
                 log::trace!("{event} >->->->->- {addr}");
@@ -160,6 +182,7 @@ impl LanMouseConnection {
                 self.connecting.clone(),
                 self.recv_tx.clone(),
                 self.ping_response.clone(),
+                self.lifecycle_tx.clone(),
             ));
         }
         Err(LanMouseConnectionError::NotConnected)
@@ -174,6 +197,7 @@ async fn connect_to_handle(
     connecting: Rc<Mutex<HashSet<ClientHandle>>>,
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    lifecycle_tx: Sender<DtlsLifecycleEvent>,
 ) -> Result<(), LanMouseConnectionError> {
     log::info!("client {handle} connecting ...");
     // sending did not work, figure out active conn.
@@ -197,6 +221,10 @@ async fn connect_to_handle(
         conns.lock().await.insert(addr, conn.clone());
         connecting.lock().await.remove(&handle);
 
+        // notify clipboard side-channel (and any other lifecycle listeners)
+        // that DTLS is up for this peer.
+        let _ = lifecycle_tx.send(DtlsLifecycleEvent::Connected(addr));
+
         // poll connection for active
         spawn_local(ping_pong(addr, conn.clone(), ping_response.clone()));
 
@@ -209,6 +237,7 @@ async fn connect_to_handle(
             conns,
             tx,
             ping_response.clone(),
+            lifecycle_tx,
         ));
         return Ok(());
     }
@@ -252,6 +281,7 @@ async fn receive_loop(
     conns: Rc<Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>>,
     tx: Sender<(ClientHandle, ProtoEvent)>,
     ping_response: Rc<RefCell<HashSet<SocketAddr>>>,
+    lifecycle_tx: Sender<DtlsLifecycleEvent>,
 ) {
     let mut buf = [0u8; MAX_EVENT_SIZE];
     while conn.recv(&mut buf).await.is_ok() {
@@ -268,7 +298,7 @@ async fn receive_loop(
         }
     }
     log::warn!("recv error");
-    disconnect(&client_manager, handle, addr, &conns).await;
+    disconnect(&client_manager, handle, addr, &conns, &lifecycle_tx).await;
 }
 
 async fn disconnect(
@@ -276,10 +306,12 @@ async fn disconnect(
     handle: ClientHandle,
     addr: SocketAddr,
     conns: &Mutex<HashMap<SocketAddr, Arc<dyn Conn + Send + Sync>>>,
+    lifecycle_tx: &Sender<DtlsLifecycleEvent>,
 ) {
     log::warn!("client ({handle}) @ {addr} connection closed");
     conns.lock().await.remove(&addr);
     client_manager.set_active_addr(handle, None);
+    let _ = lifecycle_tx.send(DtlsLifecycleEvent::Disconnected(addr));
     let active: Vec<SocketAddr> = conns.lock().await.keys().copied().collect();
     log::info!("active connections: {active:?}");
 }
