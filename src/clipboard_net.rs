@@ -119,9 +119,15 @@ enum Command {
         port: u16,
         reply: tokio::sync::oneshot::Sender<Result<u16, ClipboardNetError>>,
     },
-    /// Send a `Clipboard` message to every connected peer. Not used by Phase 2
-    /// but wired up so Phase 7 has the hook.
-    Broadcast(CapMsg),
+    /// Send a `Clipboard` message to every connected peer, skipping all
+    /// connections whose peer fingerprint matches `except_fingerprint` (used
+    /// when relaying, to avoid echoing back to the source — a peer pair may
+    /// hold two connections, one initiated by each side, so exclusion is by
+    /// fingerprint rather than address).
+    Broadcast {
+        msg: CapMsg,
+        except_fingerprint: Option<String>,
+    },
 }
 
 /// Public handle to the clipboard side-channel.
@@ -194,7 +200,19 @@ impl ClipboardNet {
 
     /// Broadcast a `Clipboard` message to every connected peer.
     pub(crate) fn broadcast(&self, msg: CapMsg) {
-        let _ = self.cmd_tx.send(Command::Broadcast(msg));
+        let _ = self.cmd_tx.send(Command::Broadcast {
+            msg,
+            except_fingerprint: None,
+        });
+    }
+
+    /// Broadcast a `Clipboard` message to every connected peer except those
+    /// with this fingerprint.
+    pub(crate) fn broadcast_except(&self, msg: CapMsg, except_fingerprint: String) {
+        let _ = self.cmd_tx.send(Command::Broadcast {
+            msg,
+            except_fingerprint: Some(except_fingerprint),
+        });
     }
 
     /// Await the next side-channel event.
@@ -279,9 +297,12 @@ async fn run_dispatcher(
                         }
                     }
                 }
-                Some(Command::Broadcast(msg)) => {
+                Some(Command::Broadcast { msg, except_fingerprint }) => {
                     let peers = state.peers.lock().await;
                     for (addr, peer) in peers.iter() {
+                        if except_fingerprint.as_deref() == Some(peer.fingerprint.as_str()) {
+                            continue;
+                        }
                         if peer.out_tx.send(msg.clone()).is_err() {
                             log::trace!("clipboard_net: peer {addr} send queue dropped");
                         }

@@ -80,9 +80,10 @@ No `Ping`/`Pong` — liveness is handled by TCP keepalive (`socket2::TcpKeepaliv
 - Each lan-mouse instance maintains `local_serial: u64` (its own counter).
 - On local clipboard change: `local_serial += 1`; broadcast `Clipboard { origin: self.peer_id, serial: local_serial, ... }`.
 - On receive: `msg.origin` **must** match the `peer_id` established by `Hello` on this connection. If not, log a warning and close the connection. Then: if `msg.serial <= last_seen[msg.origin]`, drop silently. Otherwise update `last_seen[msg.origin] = msg.serial` and apply locally.
-- A receiver applying a remote `Clipboard` does **not** re-broadcast.
+- A receiver applying a remote `Clipboard` re-originates it (own `origin`, fresh `serial`) and relays it to every peer except those whose fingerprint matches the source. This makes leaf-to-leaf propagation work in the star topology that the DTLS-driven connections actually form (leaves are only connected to the hub).
+- A remote `Clipboard` whose content equals the content the receiver already holds is dropped without applying or relaying; this terminates relay cycles (a peer pair can hold two connections — one initiated by each side — and user configs can form a mesh).
 - On fresh TCP connection completing `Hello`: reset `last_seen[origin]` to 0 (so post-restart messages from that origin are accepted).
-- `origin` is always the original copier, never an intermediate forwarder. In v1 there is no forwarding (mesh = full N×N TCP connections); the field is reserved for future relay scenarios.
+- `origin` is the fingerprint of the sending hop, not necessarily the original copier; relays re-originate, so the `origin`-vs-TLS-fingerprint check holds on every hop.
 
 ### Versioning policy
 
@@ -332,4 +333,3 @@ Each phase should compile and `cargo clippy --workspace --all-targets --all-feat
 - Content history / clipboard manager features (cliphist-style ring buffer).
 - Encryption beyond what rustls provides (DTLS for events, TLS for clipboard — both authenticated by pinned cert).
 - Compression for large payloads.
-- Forwarding / mesh relay (assumed full N×N TCP mesh — `origin` field reserved for future use).

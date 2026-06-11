@@ -215,10 +215,15 @@ impl Service {
         };
         match self.clipboard.handle_net_event(event) {
             NetOutcome::Nothing => {}
-            NetOutcome::ApplyLocal(content) => {
+            NetOutcome::ApplyLocal {
+                content,
+                relay,
+                src_fingerprint,
+            } => {
                 if let Err(e) = self.clipboard.apply_remote(content).await {
                     log::warn!("clipboard: failed to apply remote content: {e}");
                 }
+                self.clipboard_net.broadcast_except(relay, src_fingerprint);
             }
         }
     }

@@ -33,6 +33,10 @@ pub(crate) struct ClipboardState {
     last_seen: HashMap<String, u64>,
     selection_origin: SelectionOrigin,
     last_remote_content: Option<ClipboardContent>,
+    /// Content this peer currently holds (last local broadcast or remote
+    /// apply). Remote messages carrying identical content are suppressed,
+    /// which terminates relay cycles.
+    current_content: Option<ClipboardContent>,
     startup_baseline_consumed: bool,
 }
 
@@ -57,12 +61,34 @@ impl ClipboardState {
             // didn't place it there.
             selection_origin: SelectionOrigin::Local,
             last_remote_content: None,
+            current_content: None,
             startup_baseline_consumed: false,
         }
     }
 
     pub(crate) fn local_fingerprint(&self) -> &str {
         &self.local_fingerprint
+    }
+
+    fn bump_serial(&mut self) {
+        self.local_serial = self.local_serial.wrapping_add(1);
+        if self.local_serial == 0 {
+            // 0 is a sentinel for "never seen"; skip past it on wrap.
+            self.local_serial = 1;
+        }
+    }
+
+    /// Re-originate remotely-received content for relaying to other peers:
+    /// the message goes out under our own fingerprint and a fresh serial so
+    /// receivers' origin-vs-TLS-fingerprint check holds.
+    pub(crate) fn make_relay(&mut self, content: &ClipboardContent) -> CapMsg {
+        self.bump_serial();
+        CapMsg::Clipboard {
+            origin: self.local_fingerprint.clone(),
+            serial: self.local_serial,
+            mime: content.mime.clone(),
+            data: content.data.clone(),
+        }
     }
 
     /// Process a `ClipboardChange` observed by the local backend.
@@ -80,15 +106,13 @@ impl ClipboardState {
                     );
                     self.startup_baseline_consumed = true;
                     self.selection_origin = SelectionOrigin::Local;
+                    self.current_content = Some(content);
                     return LocalChangeDecision::Nothing;
                 }
 
-                self.local_serial = self.local_serial.wrapping_add(1);
-                if self.local_serial == 0 {
-                    // 0 is a sentinel for "never seen"; skip past it on wrap.
-                    self.local_serial = 1;
-                }
+                self.bump_serial();
                 self.selection_origin = SelectionOrigin::Local;
+                self.current_content = Some(content.clone());
                 log::debug!(
                     "clipboard: broadcasting local change (serial={}, mime={}, {} bytes)",
                     self.local_serial,
@@ -157,7 +181,14 @@ impl ClipboardState {
             );
         }
         let content = ClipboardContent { mime, data };
+        if self.current_content.as_ref() == Some(&content) {
+            log::debug!(
+                "clipboard: remote content from {origin} matches current content; suppressing"
+            );
+            return None;
+        }
         self.last_remote_content = Some(content.clone());
+        self.current_content = Some(content.clone());
         self.selection_origin = SelectionOrigin::Remote;
         Some(content)
     }
@@ -290,7 +321,14 @@ impl Clipboard {
                         return NetOutcome::Nothing;
                     }
                     match self.state.on_remote_message(origin, serial, mime, data) {
-                        Some(content) => NetOutcome::ApplyLocal(content),
+                        Some(content) => {
+                            let relay = self.state.make_relay(&content);
+                            NetOutcome::ApplyLocal {
+                                content,
+                                relay,
+                                src_fingerprint: claimed,
+                            }
+                        }
                         None => NetOutcome::Nothing,
                     }
                 }
@@ -301,7 +339,15 @@ impl Clipboard {
 
 /// Outcome of routing a `ClipboardNetEvent`.
 pub(crate) enum NetOutcome {
-    ApplyLocal(ClipboardContent),
+    /// Apply `content` locally and relay the re-originated message to every
+    /// peer except those whose fingerprint matches `src_fingerprint`. Relaying
+    /// makes leaf-to-leaf propagation work in a star topology, where leaves
+    /// are only connected to the hub.
+    ApplyLocal {
+        content: ClipboardContent,
+        relay: CapMsg,
+        src_fingerprint: String,
+    },
     Nothing,
 }
 
@@ -430,6 +476,47 @@ mod tests {
         let out =
             s.on_remote_message(FP_REMOTE_A.into(), 1, MIME_TEXT_UTF8.into(), b"y".to_vec());
         assert!(out.is_some());
+    }
+
+    #[test]
+    fn duplicate_remote_content_is_suppressed() {
+        let mut s = local_state();
+        let out = s.on_remote_message(FP_REMOTE_A.into(), 1, MIME_TEXT_UTF8.into(), b"x".to_vec());
+        assert!(out.is_some());
+        // Same content from a different peer with a fresh serial: suppressed,
+        // but the serial is still consumed.
+        let out = s.on_remote_message(FP_REMOTE_B.into(), 1, MIME_TEXT_UTF8.into(), b"x".to_vec());
+        assert!(out.is_none());
+        assert_eq!(s.last_seen(FP_REMOTE_B), 1);
+    }
+
+    #[test]
+    fn duplicate_content_accepted_after_local_change() {
+        let mut s = local_state();
+        let _ = s.on_local_change(local_change("baseline"));
+        let out = s.on_remote_message(FP_REMOTE_A.into(), 1, MIME_TEXT_UTF8.into(), b"x".to_vec());
+        assert!(out.is_some());
+        // Local copy of different content invalidates the suppression.
+        let _ = s.on_local_change(local_change("y"));
+        let out = s.on_remote_message(FP_REMOTE_A.into(), 2, MIME_TEXT_UTF8.into(), b"x".to_vec());
+        assert!(out.is_some());
+    }
+
+    #[test]
+    fn make_relay_re_originates_with_fresh_serial() {
+        let mut s = local_state();
+        let _ = s.on_local_change(local_change("baseline"));
+        let _ = s.on_local_change(local_change("local")); // serial 1
+        let msg = s.make_relay(&text("relayed"));
+        let (origin, serial, mime, data) = extract_clipboard(msg);
+        assert_eq!(origin, FP_LOCAL);
+        assert_eq!(serial, 2);
+        assert_eq!(mime, MIME_TEXT_UTF8);
+        assert_eq!(data, b"relayed");
+        // Relaying must not flip the selection origin.
+        let _ = s.on_remote_message(FP_REMOTE_A.into(), 1, MIME_TEXT_UTF8.into(), b"r".to_vec());
+        let _ = s.make_relay(&text("r"));
+        assert_eq!(s.selection_origin(), SelectionOrigin::Remote);
     }
 
     #[test]
@@ -662,6 +749,35 @@ mod tests {
             };
             assert!(deliver(&mut b, msg).is_some());
             assert_eq!(b.last_seen(FP_A), 1);
+        }
+
+        #[test]
+        fn relay_cycle_terminates() {
+            // Star topology with an extra leaf-to-leaf link (worst case:
+            // full mesh A-M-B). Every accepted message is relayed; content
+            // suppression must terminate the cycle.
+            const FP_M: &str = "mm:mm";
+            let mut a = ClipboardState::new(FP_A.into());
+            let mut m = ClipboardState::new(FP_M.into());
+            let mut b = ClipboardState::new(FP_B.into());
+            baseline(&mut a);
+            baseline(&mut m);
+            baseline(&mut b);
+
+            // A copies "x" and broadcasts to M (star: A is only connected
+            // to the hub M).
+            let LocalChangeDecision::Broadcast(msg) = a.on_local_change(local_change("x")) else {
+                panic!();
+            };
+            // M accepts and relays to B.
+            let content = deliver(&mut m, msg).expect("hub applies");
+            let relay = m.make_relay(&content);
+            // B accepts and relays to its peers except M (in a mesh, that
+            // includes A).
+            let content = deliver(&mut b, relay).expect("leaf applies");
+            let relay = b.make_relay(&content);
+            // A already holds "x": suppressed, cycle dead.
+            assert!(deliver(&mut a, relay).is_none());
         }
 
         #[test]
