@@ -394,10 +394,14 @@ fn drain_wakeup(fd: &OwnedFd) {
 }
 
 fn handle_set(state: &mut State, content: ClipboardContent) {
-    // Destroy previous local source so the new offer "wins" cleanly.
-    if let Some(prev) = state.local_source.take() {
-        prev.destroy();
-    }
+    // The previous local source is destroyed only AFTER set_selection has
+    // installed its replacement. If it is destroyed first while it still
+    // backs the compositor's selection, the compositor must broadcast a
+    // null selection to every data-control device -- including ours --
+    // and the Remote-origin re-claim logic turns that transient null into
+    // an infinite reclaim loop. Destroyed after, the old source is merely
+    // displaced and no null is ever emitted.
+    let prev = state.local_source.take();
     state.pending_local_send = Some(content.data);
     // Suppress the echo selection event that the compositor will emit in
     // response to set_selection below.
@@ -420,6 +424,10 @@ fn handle_set(state: &mut State, content: ClipboardContent) {
             device.set_selection(Some(&source));
             state.local_source = Some(LocalSource::Wlr(source));
         }
+    }
+
+    if let Some(prev) = prev {
+        prev.destroy();
     }
 }
 
