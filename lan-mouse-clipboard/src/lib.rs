@@ -10,6 +10,8 @@ pub mod proto;
 mod macos;
 #[cfg(wayland_clipboard)]
 mod wayland;
+#[cfg(x11_clipboard)]
+mod x11;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClipboardContent {
@@ -55,10 +57,10 @@ pub trait Clipboard: Send {
 pub enum Backend {
     #[cfg(wayland_clipboard)]
     Wayland,
+    #[cfg(x11_clipboard)]
+    X11,
     #[cfg(macos_clipboard)]
     MacOs,
-    #[cfg(windows_clipboard)]
-    Windows,
     Dummy,
 }
 
@@ -71,10 +73,10 @@ impl LanMouseClipboard {
         let inner: Box<dyn Clipboard> = match backend {
             #[cfg(wayland_clipboard)]
             Backend::Wayland => Box::new(wayland::WaylandClipboard::new(peer_id)?),
+            #[cfg(x11_clipboard)]
+            Backend::X11 => Box::new(x11::X11Clipboard::new()?),
             #[cfg(macos_clipboard)]
             Backend::MacOs => Box::new(macos::MacOsClipboard::new(peer_id)?),
-            #[cfg(windows_clipboard)]
-            Backend::Windows => todo!("windows backend not yet implemented"),
             Backend::Dummy => {
                 let _ = peer_id;
                 Box::new(dummy::DummyClipboard::new()?)
@@ -99,10 +101,10 @@ impl LanMouseClipboard {
         for backend in [
             #[cfg(wayland_clipboard)]
             Backend::Wayland,
+            #[cfg(x11_clipboard)]
+            Backend::X11,
             #[cfg(macos_clipboard)]
             Backend::MacOs,
-            #[cfg(windows_clipboard)]
-            Backend::Windows,
             Backend::Dummy,
         ] {
             match Self::with_backend(backend, peer_id) {

@@ -74,7 +74,7 @@ tokio-rustls = { version = "0.26", default-features = false, features = [
 rustls-pki-types = "1"
 socket2 = { version = "0.5", features = ["all"] }
 postcard = { version = "1.0", features = ["use-std"] }
-lan-mouse-clipboard = { path = "lan-mouse-clipboard", version = "0.1.0" }
+lan-mouse-clipboard = { path = "lan-mouse-clipboard", version = "0.1.0", default-features = false }
 rcgen = "0.13.1"
 sha2 = "0.10.8"
 notify = "8.2.0"
@@ -92,6 +92,7 @@ default = [
     "libei_emulation",
     "rdp_emulation",
     "x11_emulation",
+    "x11_clipboard",
 ]
 gtk = ["dep:lan-mouse-gtk"]
 layer_shell_capture = ["input-capture/layer_shell"]
@@ -101,6 +102,7 @@ libei_emulation = ["input-event/libei", "input-emulation/libei"]
 wlroots_emulation = ["input-emulation/wlroots"]
 x11_emulation = ["input-emulation/x11"]
 rdp_emulation = ["input-emulation/remote_desktop_portal"]
+x11_clipboard = ["lan-mouse-clipboard/x11"]
 
 [package.metadata.bundle]
 name = "Lan Mouse"

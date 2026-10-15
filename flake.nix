@@ -83,6 +83,7 @@
               ++ lib.optionals pkgs.stdenv.isLinux [
                 libX11
                 libXtst
+                libXfixes
               ];
             env.RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
           };

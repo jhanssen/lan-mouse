@@ -7,6 +7,7 @@
   gtk4,
   libadwaita,
   libXtst,
+  libXfixes,
   wrapGAppsHook4,
   librsvg,
   git,
@@ -34,6 +35,7 @@ rustPlatform.buildRustPackage {
   ++ lib.optionals stdenv.isLinux [
     libX11
     libXtst
+    libXfixes
   ];
 
   src = builtins.path {
